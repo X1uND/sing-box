@@ -1,0 +1,722 @@
+name: Sync sing-box Upstream
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ==========================================================
+      # Checkout
+      # ==========================================================
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      # ==========================================================
+      # Configure git + upstream
+      # ==========================================================
+
+      - name: Configure git and upstream
+        shell: bash
+        run: |
+          set -e
+
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          git remote remove upstream 2>/dev/null || true
+
+          git remote add upstream \
+            https://github.com/SagerNet/sing-box.git
+
+          git fetch origin --prune
+          git fetch upstream --prune --tags
+
+          echo "=== Remotes ==="
+          git remote -v
+
+      # ==========================================================
+      # Sync testing branch
+      #
+      # upstream/testing exists:
+      #   synchronize to own testing
+      #
+      # upstream/testing deleted:
+      #   preserve own testing
+      #
+      # Preserve:
+      #   own sync-upstream.yml
+      #   own sync-heartbeat
+      #
+      # Other upstream workflow files are synchronized normally.
+      # ==========================================================
+
+      - name: Sync testing branch
+        env:
+          SINGBOX_PAT: ${{ secrets.SINGBOX_PAT }}
+          TARGET_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -e
+
+          echo "=== Sync testing branch ==="
+
+          if git show-ref --verify \
+              --quiet "refs/remotes/upstream/testing"; then
+
+            echo "Upstream testing exists."
+
+            # ----------------------------------------------------
+            # Backup own sync workflow
+            # ----------------------------------------------------
+
+            rm -f /tmp/sync-upstream.yml
+
+            if git cat-file -e \
+                "origin/testing:.github/workflows/sync-upstream.yml" \
+                2>/dev/null; then
+
+              echo "Backing up own sync-upstream.yml"
+
+              git show \
+                "origin/testing:.github/workflows/sync-upstream.yml" \
+                > /tmp/sync-upstream.yml
+
+            fi
+
+            # ----------------------------------------------------
+            # Backup own heartbeat
+            # ----------------------------------------------------
+
+            rm -f /tmp/sync-heartbeat
+
+            if git cat-file -e \
+                "origin/testing:.github/sync-heartbeat" \
+                2>/dev/null; then
+
+              echo "Backing up own heartbeat"
+
+              git show \
+                "origin/testing:.github/sync-heartbeat" \
+                > /tmp/sync-heartbeat
+
+            fi
+
+            # ----------------------------------------------------
+            # Sync testing from upstream
+            # ----------------------------------------------------
+
+            git checkout -B testing upstream/testing
+
+            # ----------------------------------------------------
+            # Restore own sync workflow
+            # ----------------------------------------------------
+
+            if [ -f "/tmp/sync-upstream.yml" ]; then
+
+              echo "Restoring own sync-upstream.yml"
+
+              mkdir -p .github/workflows
+
+              cp /tmp/sync-upstream.yml \
+                .github/workflows/sync-upstream.yml
+
+            fi
+
+            # ----------------------------------------------------
+            # Restore own heartbeat
+            # ----------------------------------------------------
+
+            if [ -f "/tmp/sync-heartbeat" ]; then
+
+              echo "Restoring own heartbeat"
+
+              mkdir -p .github
+
+              cp /tmp/sync-heartbeat \
+                .github/sync-heartbeat
+
+            fi
+
+            # ----------------------------------------------------
+            # Commit
+            # ----------------------------------------------------
+
+            git add -A
+
+            if git diff --cached --quiet; then
+
+              echo "No testing changes."
+
+            else
+
+              git commit \
+                -m "chore: sync upstream testing"
+
+            fi
+
+            # ----------------------------------------------------
+            # Push testing using PAT
+            # ----------------------------------------------------
+
+            git push \
+              "https://x-access-token:${SINGBOX_PAT}@github.com/${TARGET_REPO}.git" \
+              testing:testing \
+              --force
+
+            echo "testing synchronized successfully."
+
+          else
+
+            echo "Upstream testing does not exist."
+
+            echo "Preserving own testing."
+
+            git checkout -B testing origin/testing
+
+          fi
+
+      # ==========================================================
+      # Get latest stable Release
+      #
+      # Only:
+      #   latest stable release
+      #
+      # Not:
+      #   historical releases
+      #   prereleases
+      #   drafts
+      # ==========================================================
+
+      - name: Get latest stable release
+        id: latest_release
+        env:
+          GH_TOKEN: ${{ secrets.SINGBOX_PAT }}
+        shell: bash
+        run: |
+          set -e
+
+          echo "=== Get latest stable release ==="
+
+          RELEASE_JSON=$(
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/SagerNet/sing-box/releases/latest"
+          )
+
+          TAG_NAME=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+          RELEASE_NAME=$(echo "$RELEASE_JSON" | jq -r '.name // .tag_name')
+          RELEASE_BODY=$(echo "$RELEASE_JSON" | jq -r '.body // ""')
+
+          echo "Latest stable release: ${TAG_NAME}"
+
+          {
+            echo "tag_name=${TAG_NAME}"
+            echo "release_name=${RELEASE_NAME}"
+          } >> "$GITHUB_OUTPUT"
+
+          printf '%s' "$RELEASE_BODY" \
+            > /tmp/release-body.txt
+
+          printf '%s' "$RELEASE_JSON" \
+            > /tmp/latest-release.json
+
+      # ==========================================================
+      # Sync latest stable Release tag
+      # ==========================================================
+
+      - name: Sync latest stable release tag
+        env:
+          SINGBOX_PAT: ${{ secrets.SINGBOX_PAT }}
+          TARGET_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -e
+
+          TAG_NAME="${{ steps.latest_release.outputs.tag_name }}"
+
+          echo "=== Sync Release tag ==="
+          echo "Tag: ${TAG_NAME}"
+
+          if git ls-remote --exit-code \
+              --tags \
+              "https://x-access-token:${SINGBOX_PAT}@github.com/${TARGET_REPO}.git" \
+              "refs/tags/${TAG_NAME}" \
+              >/dev/null 2>&1; then
+
+            echo "Tag ${TAG_NAME} already exists in target."
+
+          else
+
+            echo "Tag ${TAG_NAME} does not exist in target."
+
+            if ! git show-ref --verify \
+                --quiet "refs/tags/${TAG_NAME}"; then
+
+              git fetch upstream \
+                "refs/tags/${TAG_NAME}:refs/tags/${TAG_NAME}"
+
+            fi
+
+            echo "Pushing tag ${TAG_NAME}..."
+
+            git push \
+              "https://x-access-token:${SINGBOX_PAT}@github.com/${TARGET_REPO}.git" \
+              "refs/tags/${TAG_NAME}:refs/tags/${TAG_NAME}"
+
+            echo "Tag ${TAG_NAME} synchronized."
+
+          fi
+
+      # ==========================================================
+      # Create latest stable Release if missing
+      #
+      # Existing:
+      #   keep existing Release
+      #
+      # Missing:
+      #   create Release
+      #
+      # We intentionally do not PATCH an existing Release.
+      # ==========================================================
+
+      - name: Create latest stable Release if needed
+        env:
+          GH_TOKEN: ${{ secrets.SINGBOX_PAT }}
+          TARGET_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -e
+
+          TAG_NAME="${{ steps.latest_release.outputs.tag_name }}"
+          RELEASE_NAME="${{ steps.latest_release.outputs.release_name }}"
+
+          echo "=== Sync Release ==="
+          echo "Release: ${TAG_NAME}"
+
+          if gh release view \
+              "$TAG_NAME" \
+              --repo "$TARGET_REPO" \
+              >/dev/null 2>&1; then
+
+            echo "Release ${TAG_NAME} already exists."
+            echo "Keeping existing Release."
+
+          else
+
+            echo "Release ${TAG_NAME} does not exist."
+            echo "Creating Release."
+
+            gh release create \
+              "$TAG_NAME" \
+              --repo "$TARGET_REPO" \
+              --title "$RELEASE_NAME" \
+              --notes-file /tmp/release-body.txt
+
+            echo "Release ${TAG_NAME} created."
+
+          fi
+
+      # ==========================================================
+      # Sync latest Release Assets
+      #
+      # Existing same-name asset:
+      #   skip
+      #
+      # Missing asset:
+      #   download + upload
+      #
+      # Extra target assets:
+      #   never delete
+      # ==========================================================
+
+      - name: Sync latest Release Assets
+        env:
+          GH_TOKEN: ${{ secrets.SINGBOX_PAT }}
+          UPSTREAM_REPO: SagerNet/sing-box
+          TARGET_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -e
+
+          echo "=== Sync latest Release Assets ==="
+
+          LATEST_RELEASE=$(
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${UPSTREAM_REPO}/releases/latest"
+          )
+
+          TAG_NAME=$(echo "$LATEST_RELEASE" | jq -r '.tag_name')
+
+          echo "Release: ${TAG_NAME}"
+
+          TARGET_RELEASE=$(
+            gh api \
+              "/repos/${TARGET_REPO}/releases/tags/${TAG_NAME}"
+          )
+
+          TARGET_RELEASE_ID=$(echo "$TARGET_RELEASE" | jq -r '.id')
+
+          echo "Target Release ID: ${TARGET_RELEASE_ID}"
+
+          UPSTREAM_ASSETS=$(
+            echo "$LATEST_RELEASE" |
+              jq -c '.assets[]?'
+          )
+
+          if [ -z "$UPSTREAM_ASSETS" ]; then
+
+            echo "No upstream assets."
+
+            exit 0
+
+          fi
+
+          while IFS= read -r ASSET; do
+
+            ASSET_NAME=$(echo "$ASSET" | jq -r '.name')
+            ASSET_URL=$(echo "$ASSET" | jq -r '.browser_download_url')
+
+            echo ""
+            echo "Checking: ${ASSET_NAME}"
+
+            # ----------------------------------------------------
+            # Check existing asset
+            # ----------------------------------------------------
+
+            EXISTING_ASSET=$(
+              gh api \
+                "/repos/${TARGET_REPO}/releases/${TARGET_RELEASE_ID}/assets" \
+                --paginate |
+              jq -r \
+                --arg name "$ASSET_NAME" \
+                '.[] | select(.name == $name) | .id' |
+              head -n 1
+            )
+
+            if [ -n "$EXISTING_ASSET" ]; then
+
+              echo "Asset already exists."
+              echo "Skipping: ${ASSET_NAME}"
+
+              continue
+
+            fi
+
+            # ----------------------------------------------------
+            # Download asset
+            # ----------------------------------------------------
+
+            TMP_FILE="/tmp/${ASSET_NAME}"
+
+            echo "Downloading: ${ASSET_NAME}"
+
+            curl \
+              --fail \
+              --location \
+              --retry 3 \
+              --retry-delay 2 \
+              --output "$TMP_FILE" \
+              "$ASSET_URL"
+
+            # ----------------------------------------------------
+            # Encode asset name
+            # ----------------------------------------------------
+
+            ENCODED_NAME=$(
+              python3 -c \
+              'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' \
+              "$ASSET_NAME"
+            )
+
+            # ----------------------------------------------------
+            # Upload asset
+            # ----------------------------------------------------
+
+            echo "Uploading: ${ASSET_NAME}"
+
+            curl \
+              --fail \
+              --location \
+              --request POST \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header "X-GitHub-Api-Version: 2026-03-10" \
+              --header "Content-Type: application/octet-stream" \
+              --data-binary "@${TMP_FILE}" \
+              "https://uploads.github.com/repos/${TARGET_REPO}/releases/${TARGET_RELEASE_ID}/assets?name=${ENCODED_NAME}"
+
+            rm -f "$TMP_FILE"
+
+            echo "Uploaded: ${ASSET_NAME}"
+
+          done <<< "$UPSTREAM_ASSETS"
+
+          echo ""
+          echo "Release Assets synchronized."
+
+      # ==========================================================
+      # Keep only the latest 3 stable Releases
+      #
+      # Keep:
+      #   newest 3 stable Releases
+      #
+      # Delete:
+      #   older stable Releases
+      #   corresponding Release Assets
+      #   corresponding Git tags
+      #
+      # Do NOT delete:
+      #   prereleases
+      #   draft releases
+      # ==========================================================
+
+      - name: Keep latest 3 stable Releases
+        env:
+          GH_TOKEN: ${{ secrets.SINGBOX_PAT }}
+          TARGET_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -e
+
+          echo "=== Keep latest 3 stable Releases ==="
+
+          # ------------------------------------------------------
+          # Get all published, non-prerelease, non-draft Releases.
+          #
+          # GitHub returns releases newest first.
+          # ------------------------------------------------------
+
+          gh api \
+            --paginate \
+            "/repos/${TARGET_REPO}/releases?per_page=100" \
+            > /tmp/all-releases.json
+
+          jq -c '
+            [
+              .[]
+              | select(.draft == false and .prerelease == false)
+            ]
+            | sort_by(.published_at)
+            | reverse
+          ' /tmp/all-releases.json \
+            > /tmp/stable-releases.json
+
+          STABLE_COUNT=$(
+            jq 'length' /tmp/stable-releases.json
+          )
+
+          echo "Stable Release count: ${STABLE_COUNT}"
+
+          if [ "$STABLE_COUNT" -le 3 ]; then
+
+            echo "Three or fewer stable Releases."
+            echo "Nothing to delete."
+
+          else
+
+            jq -c '.[3:][]' /tmp/stable-releases.json |
+            while IFS= read -r RELEASE; do
+
+              RELEASE_ID=$(echo "$RELEASE" | jq -r '.id')
+              TAG_NAME=$(echo "$RELEASE" | jq -r '.tag_name')
+              RELEASE_NAME=$(echo "$RELEASE" | jq -r '.name // .tag_name')
+
+              echo ""
+              echo "Deleting old Release:"
+              echo "  ${RELEASE_NAME}"
+              echo "  Tag: ${TAG_NAME}"
+              echo "  ID: ${RELEASE_ID}"
+
+              # --------------------------------------------------
+              # Delete Release.
+              #
+              # This also removes its Release Assets.
+              # --------------------------------------------------
+
+              gh api \
+                --method DELETE \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2026-03-10" \
+                "/repos/${TARGET_REPO}/releases/${RELEASE_ID}"
+
+              echo "Release deleted."
+
+              # --------------------------------------------------
+              # Delete corresponding Git tag.
+              # --------------------------------------------------
+
+              if git ls-remote --exit-code \
+                  --tags \
+                  "https://x-access-token:${GH_TOKEN}@github.com/${TARGET_REPO}.git" \
+                  "refs/tags/${TAG_NAME}" \
+                  >/dev/null 2>&1; then
+
+                echo "Deleting tag ${TAG_NAME}"
+
+                git push \
+                  "https://x-access-token:${GH_TOKEN}@github.com/${TARGET_REPO}.git" \
+                  ":refs/tags/${TAG_NAME}"
+
+                echo "Tag deleted."
+
+              else
+
+                echo "Tag ${TAG_NAME} not found in target."
+
+              fi
+
+            done
+
+          fi
+
+      # ==========================================================
+      # 40-day heartbeat
+      #
+      # File:
+      #   .github/sync-heartbeat
+      #
+      # Keep outside .github/workflows/
+      # ==========================================================
+
+      - name: Keep repository active
+        env:
+          SINGBOX_PAT: ${{ secrets.SINGBOX_PAT }}
+          TARGET_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -e
+
+          echo "=== 40-day heartbeat ==="
+
+          git fetch origin testing
+          git checkout -B testing origin/testing
+
+          HEARTBEAT_FILE=".github/sync-heartbeat"
+
+          mkdir -p .github
+
+          if [ -f "$HEARTBEAT_FILE" ]; then
+
+            LAST_HEARTBEAT=$(cat "$HEARTBEAT_FILE")
+
+            LAST_HEARTBEAT_TS=$(
+              date -d "$LAST_HEARTBEAT" +%s \
+              2>/dev/null \
+              || echo 0
+            )
+
+          else
+
+            LAST_HEARTBEAT_TS=0
+
+          fi
+
+          NOW_TS=$(date +%s)
+
+          if [ "$LAST_HEARTBEAT_TS" -eq 0 ]; then
+
+            DAYS=999
+
+          else
+
+            DAYS=$(( (NOW_TS - LAST_HEARTBEAT_TS) / 86400 ))
+
+          fi
+
+          echo "Days since last heartbeat: ${DAYS}"
+
+          if [ "$DAYS" -ge 40 ]; then
+
+            NOW_UTC=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+            echo "Creating heartbeat: ${NOW_UTC}"
+
+            printf '%s\n' "$NOW_UTC" \
+              > "$HEARTBEAT_FILE"
+
+            git add "$HEARTBEAT_FILE"
+
+            git commit \
+              -m "chore: keep repository active"
+
+            git push \
+              "https://x-access-token:${SINGBOX_PAT}@github.com/${TARGET_REPO}.git" \
+              testing:testing
+
+            echo "Heartbeat committed."
+
+          else
+
+            echo "No heartbeat required."
+
+          fi
+
+      # ==========================================================
+      # Verify
+      # ==========================================================
+
+      - name: Verify
+        env:
+          GH_TOKEN: ${{ secrets.SINGBOX_PAT }}
+        shell: bash
+        run: |
+          set +e
+
+          echo "=== Verify ==="
+          echo ""
+
+          echo "Repository:"
+          echo "${GITHUB_REPOSITORY}"
+          echo ""
+
+          echo "Current branch:"
+          git branch --show-current
+          echo ""
+
+          echo "Target branches:"
+          git ls-remote --heads \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          echo ""
+
+          echo "Latest stable upstream Release:"
+
+          gh api \
+            "/repos/SagerNet/sing-box/releases/latest" |
+            jq -r '.tag_name'
+
+          echo ""
+
+          echo "Target stable Releases:"
+
+          gh api \
+            --paginate \
+            "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" |
+            jq -r '
+              .[]
+              | select(.draft == false and .prerelease == false)
+              | "\(.tag_name) | \(.name // .tag_name)"
+            '
+
+          echo ""
+
+          echo "Current target Tags:"
+
+          git ls-remote \
+            --tags \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
